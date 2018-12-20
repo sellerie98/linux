@@ -843,8 +843,9 @@ retry:
 	fat_get_blknr_offset(sbi, i_pos, &blocknr, &offset);
 	bh = sb_bread(sb, blocknr);
 	if (!bh) {
-		fat_msg(sb, KERN_ERR, "unable to read inode block "
-		       "for updating (i_pos %lld)", i_pos);
+		fat_msg_ratelimit(sb, KERN_ERR,
+			"unable to read inode block for updating (i_pos %lld)",
+			i_pos);
 		return -EIO;
 	}
 	spin_lock(&sbi->inode_hash_lock);
@@ -1671,6 +1672,18 @@ int fat_fill_super(struct super_block *sb, void *data, int silent, int isvfat,
 		}
 		brelse(bh_resize);
 	}
+
+#ifdef CONFIG_MACH_LGE
+	/* Bad formatted file system */
+	if(logical_sector_size * bpb.fat_total_sect >
+			sb->s_bdev->bd_inode->i_size) {
+		fat_msg(sb, KERN_WARNING, "bad geometry: block count %u "
+				"exceeds size of device (%lld blocks)",
+				logical_sector_size * bpb.fat_total_sect >> sb->s_blocksize_bits,
+				sb->s_bdev->bd_inode->i_size >> sb->s_blocksize_bits);
+		goto out_fail;
+	}
+#endif
 
 	mutex_init(&sbi->s_lock);
 	sbi->cluster_size = sb->s_blocksize * sbi->sec_per_clus;

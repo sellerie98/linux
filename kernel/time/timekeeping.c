@@ -442,6 +442,35 @@ u64 ktime_get_raw_fast_ns(void)
 }
 EXPORT_SYMBOL_GPL(ktime_get_raw_fast_ns);
 
+/**
+ * ktime_get_boot_fast_ns - NMI safe and fast access to boot clock.
+ *
+ * To keep it NMI safe since we're accessing from tracing, we're not using a
+ * separate timekeeper with updates to monotonic clock and boot offset
+ * protected with seqlocks. This has the following minor side effects:
+ *
+ * (1) Its possible that a timestamp be taken after the boot offset is updated
+ * but before the timekeeper is updated. If this happens, the new boot offset
+ * is added to the old timekeeping making the clock appear to update slightly
+ * earlier:
+ *    CPU 0                                        CPU 1
+ *    timekeeping_inject_sleeptime64()
+ *    __timekeeping_inject_sleeptime(tk, delta);
+ *                                                 timestamp();
+ *    timekeeping_update(tk, TK_CLEAR_NTP...);
+ *
+ * (2) On 32-bit systems, the 64-bit boot offset (tk->offs_boot) may be
+ * partially updated.  Since the tk->offs_boot update is a rare event, this
+ * should be a rare occurrence which postprocessing should be able to handle.
+ */
+u64 notrace ktime_get_boot_fast_ns(void)
+{
+	struct timekeeper *tk = &tk_core.timekeeper;
+
+	return (ktime_get_mono_fast_ns() + ktime_to_ns(tk->offs_boot));
+}
+EXPORT_SYMBOL_GPL(ktime_get_boot_fast_ns);
+
 /* Suspend-time cycles value for halted fast timekeeper. */
 static cycle_t cycles_at_suspend;
 
@@ -1475,8 +1504,20 @@ void __weak read_boot_clock64(struct timespec64 *ts)
 	ts->tv_nsec = 0;
 }
 
-/* Flag for if timekeeping_resume() has injected sleeptime */
-static bool sleeptime_injected;
+/*
+ * Flag reflecting whether timekeeping_resume() has injected sleeptime.
+ *
+ * The flag starts of false and is only set when a suspend reaches
+ * timekeeping_suspend(), timekeeping_resume() sets it to false when the
+ * timekeeper clocksource is not stopping across suspend and has been
+ * used to update sleep time. If the timekeeper clocksource has stopped
+ * then the flag stays true and is used by the RTC resume code to decide
+ * whether sleeptime must be injected and if so the flag gets false then.
+ *
+ * If a suspend fails before reaching timekeeping_resume() then the flag
+ * stays false and prevents erroneous sleeptime injection.
+ */
+static bool suspend_timing_needed;
 
 /* Flag for if there is a persistent clock on this platform */
 static bool persistent_clock_exists;
@@ -1576,7 +1617,7 @@ static void __timekeeping_inject_sleeptime(struct timekeeper *tk,
  */
 bool timekeeping_rtc_skipresume(void)
 {
-	return sleeptime_injected;
+	return !suspend_timing_needed;
 }
 
 /**
@@ -1612,6 +1653,8 @@ void timekeeping_inject_sleeptime64(struct timespec64 *delta)
 	raw_spin_lock_irqsave(&timekeeper_lock, flags);
 	write_seqcount_begin(&tk_core.seq);
 
+	suspend_timing_needed = false;
+
 	timekeeping_forward_now(tk);
 
 	__timekeeping_inject_sleeptime(tk, delta);
@@ -1636,8 +1679,8 @@ void timekeeping_resume(void)
 	unsigned long flags;
 	struct timespec64 ts_new, ts_delta;
 	cycle_t cycle_now, cycle_delta;
+	bool inject_sleeptime = false;
 
-	sleeptime_injected = false;
 	read_persistent_clock64(&ts_new);
 
 	clockevents_resume();
@@ -1683,14 +1726,19 @@ void timekeeping_resume(void)
 		nsec += ((u64) cycle_delta * mult) >> shift;
 
 		ts_delta = ns_to_timespec64(nsec);
-		sleeptime_injected = true;
+		inject_sleeptime = true;
 	} else if (timespec64_compare(&ts_new, &timekeeping_suspend_time) > 0) {
 		ts_delta = timespec64_sub(ts_new, timekeeping_suspend_time);
-		sleeptime_injected = true;
+		inject_sleeptime = true;
 	}
 
-	if (sleeptime_injected)
+	if (inject_sleeptime) {
+		suspend_timing_needed = false;
 		__timekeeping_inject_sleeptime(tk, &ts_delta);
+
+		pr_info("Suspended for %lu.%03lu seconds\n", ts_delta.tv_sec,
+			ts_delta.tv_nsec / NSEC_PER_MSEC);
+	}
 
 	/* Re-base the last cycle value */
 	tk->tkr_mono.cycle_last = cycle_now;
@@ -1724,6 +1772,8 @@ int timekeeping_suspend(void)
 	 */
 	if (timekeeping_suspend_time.tv_sec || timekeeping_suspend_time.tv_nsec)
 		persistent_clock_exists = true;
+
+	suspend_timing_needed = true;
 
 	raw_spin_lock_irqsave(&timekeeper_lock, flags);
 	write_seqcount_begin(&tk_core.seq);

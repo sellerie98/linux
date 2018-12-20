@@ -15,7 +15,10 @@
 #include <linux/seq_file.h>
 #include <linux/debugfs.h>
 #include <linux/pm_wakeirq.h>
+#include <linux/types.h>
 #include <trace/events/power.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
 
 #include "power.h"
 
@@ -804,6 +807,38 @@ void pm_wakeup_event(struct device *dev, unsigned int msec)
 }
 EXPORT_SYMBOL_GPL(pm_wakeup_event);
 
+void pm_get_active_wakeup_sources(char *pending_wakeup_source, size_t max)
+{
+	struct wakeup_source *ws, *last_active_ws = NULL;
+	int len = 0;
+	bool active = false;
+	int srcuidx;
+
+	srcuidx = srcu_read_lock(&wakeup_srcu);
+	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
+		if (ws->active && len < max) {
+			if (!active)
+				len += scnprintf(pending_wakeup_source, max,
+						"Pending Wakeup Sources: ");
+			len += scnprintf(pending_wakeup_source + len, max - len,
+				"%s ", ws->name);
+			active = true;
+		} else if (!active &&
+			   (!last_active_ws ||
+			    ktime_to_ns(ws->last_time) >
+			    ktime_to_ns(last_active_ws->last_time))) {
+			last_active_ws = ws;
+		}
+	}
+	if (!active && last_active_ws) {
+		scnprintf(pending_wakeup_source, max,
+				"Last active Wakeup Source: %s",
+				last_active_ws->name);
+	}
+	srcu_read_unlock(&wakeup_srcu, srcuidx);
+}
+EXPORT_SYMBOL_GPL(pm_get_active_wakeup_sources);
+
 void pm_print_active_wakeup_sources(void)
 {
 	struct wakeup_source *ws;
@@ -811,6 +846,29 @@ void pm_print_active_wakeup_sources(void)
 	struct wakeup_source *last_activity_ws = NULL;
 
 	srcuidx = srcu_read_lock(&wakeup_srcu);
+
+#ifdef CONFIG_LGE_PM
+	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
+		if (ws->active) {
+			ws->pending_count++;
+			pr_info("active wakeup source: %s pending_count: %lu\n",
+				ws->name, ws->pending_count);
+			active = 1;
+		} else if (!active &&
+			    (!last_activity_ws ||
+			     ktime_to_ns(ws->last_time) >
+			     ktime_to_ns(last_activity_ws->last_time))) {
+			last_activity_ws = ws;
+		}
+	}
+
+	if (!active && last_activity_ws) {
+		last_activity_ws->pending_count++;
+		pr_info("last active wakeup source: %s pending_count: %lu\n",
+			last_activity_ws->name,
+			last_activity_ws->pending_count);
+	}
+#else
 	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
 		if (ws->active) {
 			pr_info("active wakeup source: %s\n", ws->name);
@@ -826,6 +884,7 @@ void pm_print_active_wakeup_sources(void)
 	if (!active && last_activity_ws)
 		pr_info("last active wakeup source: %s\n",
 			last_activity_ws->name);
+#endif
 	srcu_read_unlock(&wakeup_srcu, srcuidx);
 }
 EXPORT_SYMBOL_GPL(pm_print_active_wakeup_sources);
@@ -876,7 +935,21 @@ void pm_wakeup_clear(void)
 
 void pm_system_irq_wakeup(unsigned int irq_number)
 {
+	struct irq_desc *desc;
+	const char *name = "null";
+
 	if (pm_wakeup_irq == 0) {
+		if (msm_show_resume_irq_mask) {
+			desc = irq_to_desc(irq_number);
+			if (desc == NULL)
+				name = "stray irq";
+			else if (desc->action && desc->action->name)
+				name = desc->action->name;
+
+			pr_warn("%s: %d triggered %s\n", __func__,
+					irq_number, name);
+
+		}
 		pm_wakeup_irq = irq_number;
 		pm_system_wakeup();
 	}
@@ -1010,18 +1083,72 @@ static int print_wakeup_source_stats(struct seq_file *m,
 	} else {
 		active_time = ktime_set(0, 0);
 	}
-
-	seq_printf(m, "%-12s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t%lld\t\t%lld\t\t%lld\t\t%lld\t\t%lld\n",
+#ifdef CONFIG_LGE_PM
+	seq_printf(m, "%-12s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t%lld\t\t%lld\t\t%lld\t\t%lld\t\t%lld\t\t%lu\n",
+		   ws->name, active_count, ws->event_count,
+		   ws->wakeup_count, ws->expire_count,
+		   ktime_to_ms(active_time), ktime_to_ms(total_time),
+		   ktime_to_ms(max_time), ktime_to_ms(ws->last_time),
+		   ktime_to_ms(prevent_sleep_time), ws->pending_count);
+#else
+	seq_printf(m, "%-32s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t%lld\t\t%lld\t\t%lld\t\t%lld\t\t%lld\n",
 		   ws->name, active_count, ws->event_count,
 		   ws->wakeup_count, ws->expire_count,
 		   ktime_to_ms(active_time), ktime_to_ms(total_time),
 		   ktime_to_ms(max_time), ktime_to_ms(ws->last_time),
 		   ktime_to_ms(prevent_sleep_time));
-
+#endif
 	spin_unlock_irqrestore(&ws->lock, flags);
 
 	return 0;
 }
+
+#ifdef CONFIG_LGE_PM
+static int print_wakeup_source_active_stats(struct seq_file *m,
+	struct wakeup_source *ws)
+{
+	unsigned long flags;
+	ktime_t total_time;
+	ktime_t max_time;
+	unsigned long active_count;
+	ktime_t active_time;
+	ktime_t prevent_sleep_time;
+
+	spin_lock_irqsave(&ws->lock, flags);
+
+	total_time = ws->total_time;
+	max_time = ws->max_time;
+	prevent_sleep_time = ws->prevent_sleep_time;
+	active_count = ws->active_count;
+	if (ws->active) {
+		ktime_t now = ktime_get();
+
+		active_time = ktime_sub(now, ws->last_time);
+		total_time = ktime_add(total_time, active_time);
+		if (active_time.tv64 > max_time.tv64)
+			max_time = active_time;
+
+		if (ws->autosleep_enabled)
+			prevent_sleep_time = ktime_add(prevent_sleep_time,
+				ktime_sub(now, ws->start_prevent_time));
+	} else {
+		active_time = ktime_set(0, 0);
+	}
+
+	if (ktime_to_ms(active_time) > 0)
+		seq_printf(m, "%-12s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t"
+			"%lld\t\t%lld\t\t%lld\t\t%lld\t\t%lld\t\t%lu\n",
+			ws->name, active_count, ws->event_count,
+			ws->wakeup_count, ws->expire_count,
+			ktime_to_ms(active_time), ktime_to_ms(total_time),
+			ktime_to_ms(max_time), ktime_to_ms(ws->last_time),
+			ktime_to_ms(prevent_sleep_time), ws->pending_count);
+	spin_unlock_irqrestore(&ws->lock, flags);
+
+	return 0;
+}
+#endif
+
 
 /**
  * wakeup_sources_stats_show - Print wakeup sources statistics information.
@@ -1032,9 +1159,15 @@ static int wakeup_sources_stats_show(struct seq_file *m, void *unused)
 	struct wakeup_source *ws;
 	int srcuidx;
 
+#ifdef CONFIG_LGE_PM
 	seq_puts(m, "name\t\tactive_count\tevent_count\twakeup_count\t"
+		"expire_count\tactive_since\ttotal_time\t"
+		"max_time\tlast_change\tprevent_suspend_time\tpending_count\n");
+#else
+	seq_puts(m, "name\t\t\t\t\tactive_count\tevent_count\twakeup_count\t"
 		"expire_count\tactive_since\ttotal_time\tmax_time\t"
 		"last_change\tprevent_suspend_time\n");
+#endif
 
 	srcuidx = srcu_read_lock(&wakeup_srcu);
 	list_for_each_entry_rcu(ws, &wakeup_sources, entry)
@@ -1046,10 +1179,37 @@ static int wakeup_sources_stats_show(struct seq_file *m, void *unused)
 	return 0;
 }
 
+#ifdef CONFIG_LGE_PM
+static int wakeup_sources_active_stats_show(struct seq_file *m, void *unused)
+{
+	struct wakeup_source *ws;
+	int srcuidx;
+
+	seq_puts(m, "name\t\tactive_count\tevent_count\twakeup_count\t"
+		"expire_count\tactive_since\ttotal_time\t"
+		"max_time\tlast_change\tprevent_suspend_time\tpending_count\n");
+
+	srcuidx = srcu_read_lock(&wakeup_srcu);
+	list_for_each_entry_rcu(ws, &wakeup_sources, entry)
+		print_wakeup_source_active_stats(m, ws);
+	srcu_read_unlock(&wakeup_srcu, srcuidx);
+
+	return 0;
+}
+#endif
+
 static int wakeup_sources_stats_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, wakeup_sources_stats_show, NULL);
 }
+
+#ifdef CONFIG_LGE_PM
+static int wakeup_sources_active_stats_open(struct inode *inode,
+	struct file *file)
+{
+	return single_open(file, wakeup_sources_active_stats_show, NULL);
+}
+#endif
 
 static const struct file_operations wakeup_sources_stats_fops = {
 	.owner = THIS_MODULE,
@@ -1059,10 +1219,26 @@ static const struct file_operations wakeup_sources_stats_fops = {
 	.release = single_release,
 };
 
+#ifdef CONFIG_LGE_PM
+static const struct file_operations wakeup_sources_active_stats_fops = {
+	.owner = THIS_MODULE,
+	.open = wakeup_sources_active_stats_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+#endif
+
 static int __init wakeup_sources_debugfs_init(void)
 {
 	wakeup_sources_stats_dentry = debugfs_create_file("wakeup_sources",
 			S_IRUGO, NULL, NULL, &wakeup_sources_stats_fops);
+
+#ifdef CONFIG_LGE_PM
+	wakeup_sources_stats_dentry = debugfs_create_file(
+		"wakeup_sources_active", S_IRUGO, NULL,
+		NULL, &wakeup_sources_active_stats_fops);
+#endif
 	return 0;
 }
 

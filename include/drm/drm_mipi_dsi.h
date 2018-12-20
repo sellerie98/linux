@@ -21,12 +21,17 @@ struct mipi_dsi_device;
 #define MIPI_DSI_MSG_REQ_ACK	BIT(0)
 /* use Low Power Mode to transmit message */
 #define MIPI_DSI_MSG_USE_LPM	BIT(1)
+/* read mipi_dsi_msg.ctrl and unicast to only that ctrls */
+#define MIPI_DSI_MSG_UNICAST	BIT(2)
+/* Stack all commands until lastcommand bit and trigger all in one go */
+#define MIPI_DSI_MSG_LASTCOMMAND BIT(3)
 
 /**
  * struct mipi_dsi_msg - read/write DSI buffer
  * @channel: virtual channel id
  * @type: payload data type
  * @flags: flags controlling this message transmission
+ * @ctrl: ctrl index to transmit on
  * @tx_len: length of @tx_buf
  * @tx_buf: data to be written
  * @rx_len: length of @rx_buf
@@ -36,6 +41,7 @@ struct mipi_dsi_msg {
 	u8 channel;
 	u8 type;
 	u16 flags;
+	u32 ctrl;
 
 	size_t tx_len;
 	const void *tx_buf;
@@ -274,6 +280,10 @@ int mipi_dsi_dcs_set_display_brightness(struct mipi_dsi_device *dsi,
 					u16 brightness);
 int mipi_dsi_dcs_get_display_brightness(struct mipi_dsi_device *dsi,
 					u16 *brightness);
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+int mipi_dsi_dcs_set_display_brightness_short(struct mipi_dsi_device *dsi,
+					u16 brightness);
+#endif
 
 /**
  * struct mipi_dsi_driver - DSI driver

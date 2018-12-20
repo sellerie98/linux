@@ -635,18 +635,50 @@ isolate_freepages_range(struct compact_control *cc,
 }
 
 /* Similar to reclaim, but different enough that they don't share logic */
-static bool too_many_isolated(struct zone *zone)
+static bool __too_many_isolated(struct zone *zone, int safe)
 {
 	unsigned long active, inactive, isolated;
 
-	inactive = node_page_state(zone->zone_pgdat, NR_INACTIVE_FILE) +
+	if (safe) {
+		inactive = node_page_state_snapshot(zone->zone_pgdat,
+			NR_INACTIVE_FILE) +
+			node_page_state_snapshot(zone->zone_pgdat,
+			NR_INACTIVE_ANON);
+		active = node_page_state_snapshot(zone->zone_pgdat,
+			NR_ACTIVE_FILE) +
+			node_page_state_snapshot(zone->zone_pgdat,
+			NR_ACTIVE_ANON);
+		isolated = node_page_state_snapshot(zone->zone_pgdat,
+			NR_ISOLATED_FILE) +
+			node_page_state_snapshot(zone->zone_pgdat,
+			NR_ISOLATED_ANON);
+	} else {
+		inactive = node_page_state(zone->zone_pgdat, NR_INACTIVE_FILE) +
 			node_page_state(zone->zone_pgdat, NR_INACTIVE_ANON);
-	active = node_page_state(zone->zone_pgdat, NR_ACTIVE_FILE) +
+		active = node_page_state(zone->zone_pgdat, NR_ACTIVE_FILE) +
 			node_page_state(zone->zone_pgdat, NR_ACTIVE_ANON);
-	isolated = node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE) +
+		isolated = node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE) +
 			node_page_state(zone->zone_pgdat, NR_ISOLATED_ANON);
+	}
 
 	return isolated > (inactive + active) / 2;
+}
+
+/* Similar to reclaim, but different enough that they don't share logic */
+static bool too_many_isolated(struct compact_control *cc)
+{
+	/*
+	 * __too_many_isolated(safe=0) is fast but inaccurate, because it
+	 * doesn't account for the vm_stat_diff[] counters.  So if it looks
+	 * like too_many_isolated() is about to return true, fall back to the
+	 * slower, more accurate zone_page_state_snapshot().
+	 */
+	if (unlikely(__too_many_isolated(cc->zone, 0))) {
+		if (cc->mode != MIGRATE_ASYNC)
+			return __too_many_isolated(cc->zone, 1);
+	}
+
+	return false;
 }
 
 /**
@@ -686,7 +718,7 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 	 * list by either parallel reclaimers or compaction. If there are,
 	 * delay for some time until fewer pages are isolated
 	 */
-	while (unlikely(too_many_isolated(zone))) {
+	while (unlikely(too_many_isolated(cc))) {
 		/* async migration should just abort */
 		if (cc->mode == MIGRATE_ASYNC)
 			return 0;
@@ -1272,7 +1304,6 @@ static enum compact_result __compact_finished(struct zone *zone, struct compact_
 			    const int migratetype)
 {
 	unsigned int order;
-	unsigned long watermark;
 
 	if (cc->contended || fatal_signal_pending(current))
 		return COMPACT_CONTENDED;
@@ -1298,13 +1329,6 @@ static enum compact_result __compact_finished(struct zone *zone, struct compact_
 	}
 
 	if (is_via_compact_memory(cc->order))
-		return COMPACT_CONTINUE;
-
-	/* Compaction run is not finished if the watermark is not met */
-	watermark = zone->watermark[cc->alloc_flags & ALLOC_WMARK_MASK];
-
-	if (!zone_watermark_ok(zone, cc->order, watermark, cc->classzone_idx,
-							cc->alloc_flags))
 		return COMPACT_CONTINUE;
 
 	/* Direct compactor: Is a suitable page free? */

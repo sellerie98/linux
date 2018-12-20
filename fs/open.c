@@ -34,8 +34,29 @@
 
 #include "internal.h"
 
-int do_truncate(struct dentry *dentry, loff_t length, unsigned int time_attrs,
-	struct file *filp)
+/* LGE_CHANGE_S
+ *
+ * do read/mmap profiling during booting
+ * in order to use the data as readahead args
+ *
+ * byungchul.park@lge.com 20120503
+ */
+#include "sreadahead_prof.h"
+/* LGE_CHAGE_E */
+
+#ifdef CONFIG_MDFPP_CCAUDIT
+#include <linux/cc_mode.h>
+#define ccaudit_permck(error, fname, flags) \
+{ \
+	if (unlikely((error == -EACCES) || (error == -EPERM) || (error == -EROFS))) \
+		if ((flags && (flags & (O_WRONLY | O_RDWR | O_TRUNC | O_APPEND))) || !flags ) \
+                        if(!strstr(fname,"@classes.dex.flock")) \
+                                printk("[CCAudit] %s error=%d file=%s flag=%d proc=%s parent=%s\n", __func__, (int)error, fname /*tmp->name*/, flags, current->comm, current->real_parent->comm); \
+}
+#endif
+
+int do_truncate2(struct vfsmount *mnt, struct dentry *dentry, loff_t length,
+		unsigned int time_attrs, struct file *filp)
 {
 	int ret;
 	struct iattr newattrs;
@@ -60,18 +81,25 @@ int do_truncate(struct dentry *dentry, loff_t length, unsigned int time_attrs,
 
 	inode_lock(dentry->d_inode);
 	/* Note any delegations or leases have already been broken: */
-	ret = notify_change(dentry, &newattrs, NULL);
+	ret = notify_change2(mnt, dentry, &newattrs, NULL);
 	inode_unlock(dentry->d_inode);
 	return ret;
+}
+int do_truncate(struct dentry *dentry, loff_t length, unsigned int time_attrs,
+	struct file *filp)
+{
+	return do_truncate2(NULL, dentry, length, time_attrs, filp);
 }
 
 long vfs_truncate(const struct path *path, loff_t length)
 {
 	struct inode *inode;
+	struct vfsmount *mnt;
 	struct dentry *upperdentry;
 	long error;
 
 	inode = path->dentry->d_inode;
+	mnt = path->mnt;
 
 	/* For directories it's -EISDIR, for other non-regulars - -EINVAL */
 	if (S_ISDIR(inode->i_mode))
@@ -83,7 +111,7 @@ long vfs_truncate(const struct path *path, loff_t length)
 	if (error)
 		goto out;
 
-	error = inode_permission(inode, MAY_WRITE);
+	error = inode_permission2(mnt, inode, MAY_WRITE);
 	if (error)
 		goto mnt_drop_write_and_out;
 
@@ -117,7 +145,7 @@ long vfs_truncate(const struct path *path, loff_t length)
 	if (!error)
 		error = security_path_truncate(path);
 	if (!error)
-		error = do_truncate(path->dentry, length, 0, NULL);
+		error = do_truncate2(mnt, path->dentry, length, 0, NULL);
 
 put_write_and_out:
 	put_write_access(upperdentry->d_inode);
@@ -166,6 +194,7 @@ static long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
 {
 	struct inode *inode;
 	struct dentry *dentry;
+	struct vfsmount *mnt;
 	struct fd f;
 	int error;
 
@@ -182,6 +211,7 @@ static long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
 		small = 0;
 
 	dentry = f.file->f_path.dentry;
+	mnt = f.file->f_path.mnt;
 	inode = dentry->d_inode;
 	error = -EINVAL;
 	if (!S_ISREG(inode->i_mode) || !(f.file->f_mode & FMODE_WRITE))
@@ -201,7 +231,7 @@ static long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
 	if (!error)
 		error = security_path_truncate(&f.file->f_path);
 	if (!error)
-		error = do_truncate(dentry, length, ATTR_MTIME|ATTR_CTIME, f.file);
+		error = do_truncate2(mnt, dentry, length, ATTR_MTIME|ATTR_CTIME, f.file);
 	sb_end_write(inode->i_sb);
 out_putf:
 	fdput(f);
@@ -357,6 +387,7 @@ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
 	struct cred *override_cred;
 	struct path path;
 	struct inode *inode;
+	struct vfsmount *mnt;
 	int res;
 	unsigned int lookup_flags = LOOKUP_FOLLOW;
 
@@ -387,6 +418,7 @@ retry:
 		goto out;
 
 	inode = d_backing_inode(path.dentry);
+	mnt = path.mnt;
 
 	if ((mode & MAY_EXEC) && S_ISREG(inode->i_mode)) {
 		/*
@@ -398,7 +430,7 @@ retry:
 			goto out_path_release;
 	}
 
-	res = inode_permission(inode, mode | MAY_ACCESS);
+	res = inode_permission2(mnt, inode, mode | MAY_ACCESS);
 	/* SuS v2 requires we report a read only fs too */
 	if (res || !(mode & S_IWOTH) || special_file(inode->i_mode))
 		goto out_path_release;
@@ -442,7 +474,7 @@ retry:
 	if (error)
 		goto out;
 
-	error = inode_permission(path.dentry->d_inode, MAY_EXEC | MAY_CHDIR);
+	error = inode_permission2(path.mnt, path.dentry->d_inode, MAY_EXEC | MAY_CHDIR);
 	if (error)
 		goto dput_and_out;
 
@@ -462,6 +494,7 @@ SYSCALL_DEFINE1(fchdir, unsigned int, fd)
 {
 	struct fd f = fdget_raw(fd);
 	struct inode *inode;
+	struct vfsmount *mnt;
 	int error = -EBADF;
 
 	error = -EBADF;
@@ -469,12 +502,13 @@ SYSCALL_DEFINE1(fchdir, unsigned int, fd)
 		goto out;
 
 	inode = file_inode(f.file);
+	mnt = f.file->f_path.mnt;
 
 	error = -ENOTDIR;
 	if (!S_ISDIR(inode->i_mode))
 		goto out_putf;
 
-	error = inode_permission(inode, MAY_EXEC | MAY_CHDIR);
+	error = inode_permission2(mnt, inode, MAY_EXEC | MAY_CHDIR);
 	if (!error)
 		set_fs_pwd(current->fs, &f.file->f_path);
 out_putf:
@@ -493,7 +527,7 @@ retry:
 	if (error)
 		goto out;
 
-	error = inode_permission(path.dentry->d_inode, MAY_EXEC | MAY_CHDIR);
+	error = inode_permission2(path.mnt, path.dentry->d_inode, MAY_EXEC | MAY_CHDIR);
 	if (error)
 		goto dput_and_out;
 
@@ -522,10 +556,19 @@ static int chmod_common(const struct path *path, umode_t mode)
 	struct inode *delegated_inode = NULL;
 	struct iattr newattrs;
 	int error;
+#ifdef CONFIG_MDFPP_CCAUDIT
+        int cc_flag = get_cc_mode_state();
+#endif
 
 	error = mnt_want_write(path->mnt);
-	if (error)
+	if (error){
+#ifdef CONFIG_MDFPP_CCAUDIT
+	if ((cc_flag & FLAG_CC_AUDIT_LOGGING) == FLAG_CC_AUDIT_LOGGING) {
+		ccaudit_permck(error, path->dentry->d_iname, 0);
+        }
+#endif
 		return error;
+	}
 retry_deleg:
 	inode_lock(inode);
 	error = security_path_chmod(path, mode);
@@ -533,7 +576,7 @@ retry_deleg:
 		goto out_unlock;
 	newattrs.ia_mode = (mode & S_IALLUGO) | (inode->i_mode & ~S_IALLUGO);
 	newattrs.ia_valid = ATTR_MODE | ATTR_CTIME;
-	error = notify_change(path->dentry, &newattrs, &delegated_inode);
+	error = notify_change2(path->mnt, path->dentry, &newattrs, &delegated_inode);
 out_unlock:
 	inode_unlock(inode);
 	if (delegated_inode) {
@@ -542,6 +585,11 @@ out_unlock:
 			goto retry_deleg;
 	}
 	mnt_drop_write(path->mnt);
+#ifdef CONFIG_MDFPP_CCAUDIT
+	if ((cc_flag & FLAG_CC_AUDIT_LOGGING) == FLAG_CC_AUDIT_LOGGING) {
+	        ccaudit_permck(error, path->dentry->d_iname, 0);
+        }
+#endif
 	return error;
 }
 
@@ -613,7 +661,7 @@ retry_deleg:
 	inode_lock(inode);
 	error = security_path_chown(path, uid, gid);
 	if (!error)
-		error = notify_change(path->dentry, &newattrs, &delegated_inode);
+		error = notify_change2(path->mnt, path->dentry, &newattrs, &delegated_inode);
 	inode_unlock(inode);
 	if (delegated_inode) {
 		error = break_deleg_wait(&delegated_inode);
@@ -1046,6 +1094,9 @@ long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 	struct open_flags op;
 	int fd = build_open_flags(flags, mode, &op);
 	struct filename *tmp;
+#ifdef CONFIG_MDFPP_CCAUDIT
+        int cc_flag = get_cc_mode_state();
+#endif
 
 	if (fd)
 		return fd;
@@ -1058,11 +1109,25 @@ long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 	if (fd >= 0) {
 		struct file *f = do_filp_open(dfd, tmp, &op);
 		if (IS_ERR(f)) {
+#ifdef CONFIG_MDFPP_CCAUDIT
+	                if ((cc_flag & FLAG_CC_AUDIT_LOGGING) == FLAG_CC_AUDIT_LOGGING) {
+		                ccaudit_permck(PTR_ERR(f), tmp->name, flags);
+                        }
+#endif
 			put_unused_fd(fd);
 			fd = PTR_ERR(f);
 		} else {
 			fsnotify_open(f);
 			fd_install(fd, f);
+			/* LGE_CHANGE_S
+			*
+			* do read/mmap profiling during booting
+			* in order to use the data as readahead args
+			*
+			* byungchul.park@lge.com 20120503
+			*/
+			sreadahead_prof( f, 0, 0);
+			/* LGE_CHANGE_E */
 		}
 	}
 	putname(tmp);

@@ -209,6 +209,9 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	u8 *data;
 	bool pfmemalloc;
 
+	if (IS_ENABLED(CONFIG_FORCE_ALLOC_FROM_DMA_ZONE))
+		gfp_mask |= GFP_DMA;
+
 	cache = (flags & SKB_ALLOC_FCLONE)
 		? skbuff_fclone_cache : skbuff_head_cache;
 
@@ -366,6 +369,9 @@ static void *__netdev_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
 	struct page_frag_cache *nc;
 	unsigned long flags;
 	void *data;
+
+	if (IS_ENABLED(CONFIG_FORCE_ALLOC_FROM_DMA_ZONE))
+		gfp_mask |= GFP_DMA;
 
 	local_irq_save(flags);
 	nc = this_cpu_ptr(&netdev_alloc_cache);
@@ -562,7 +568,11 @@ static inline void skb_drop_fraglist(struct sk_buff *skb)
 	skb_drop_list(&skb_shinfo(skb)->frag_list);
 }
 
+#ifdef CONFIG_LGP_DATA_TCPIP_MPTCP
+void skb_clone_fraglist(struct sk_buff *skb)
+#else
 static void skb_clone_fraglist(struct sk_buff *skb)
+#endif
 {
 	struct sk_buff *list;
 
@@ -1056,7 +1066,11 @@ static void skb_headers_offset_update(struct sk_buff *skb, int off)
 	skb->inner_mac_header += off;
 }
 
+#ifdef CONFIG_LGP_DATA_TCPIP_MPTCP
+void copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+#else
 static void copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+#endif
 {
 	__copy_skb_header(new, old);
 

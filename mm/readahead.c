@@ -177,8 +177,16 @@ int __do_page_cache_readahead(struct address_space *mapping, struct file *filp,
 		rcu_read_lock();
 		page = radix_tree_lookup(&mapping->page_tree, page_offset);
 		rcu_read_unlock();
+#ifdef CONFIG_LGE_ADAPTIVE_READAHEAD
+        if(page && !radix_tree_exceptional_entry(page)) {
+            if(page_idx == nr_to_read - lookahead_size)
+                SetPageReadahead(page);
+            continue;
+        }
+#else
 		if (page && !radix_tree_exceptional_entry(page))
 			continue;
+#endif
 
 		page = __page_cache_alloc(gfp_mask);
 		if (!page)
@@ -233,6 +241,8 @@ int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
 
 /*
  * Set the initial window size, round to next power of 2 and square
+ * Small size is not dependent on max value - only a one-page read is regarded
+ * as small.
  * for small size, x 4 for medium, and x 2 for large
  * for 128k (32 page) max ra
  * 1-8 page = 32k initial, > 8 page = 128k initial
@@ -241,7 +251,7 @@ static unsigned long get_init_ra_size(unsigned long size, unsigned long max)
 {
 	unsigned long newsize = roundup_pow_of_two(size);
 
-	if (newsize <= max / 32)
+	if (newsize <= 1)
 		newsize = newsize * 4;
 	else if (newsize <= max / 4)
 		newsize = newsize * 2;
@@ -410,7 +420,14 @@ ondemand_readahead(struct address_space *mapping,
 		ra->size = start - offset;	/* old async_size */
 		ra->size += req_size;
 		ra->size = get_next_ra_size(ra, max);
+#ifdef CONFIG_LGE_ADAPTIVE_READAHEAD
+		if (ra->size == max)
+			ra->async_size = ra->size;
+		else
+			ra->async_size = ra->size - ra->size/3;
+#else
 		ra->async_size = ra->size;
+#endif
 		goto readit;
 	}
 

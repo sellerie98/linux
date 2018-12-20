@@ -52,6 +52,7 @@ struct led_classdev {
 #define LED_DEV_CAP_FLASH	(1 << 24)
 #define LED_HW_PLUGGABLE	(1 << 25)
 #define LED_PANIC_INDICATOR	(1 << 26)
+#define LED_KEEP_TRIGGER	(1 << 27)
 
 	/* Set LED brightness level
 	 * Must not sleep. Use brightness_set_blocking for drivers
@@ -107,6 +108,11 @@ struct led_classdev {
 
 	/* Ensures consistent access to the LED Flash Class device */
 	struct mutex		led_access;
+
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_USE_FSC)
+	void (*set_fsc)(struct led_classdev *led_cdev, int fsc);
+	bool set_fsc_en;
+#endif
 };
 
 extern int led_classdev_register(struct device *parent,
