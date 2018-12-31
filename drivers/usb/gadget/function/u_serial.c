@@ -304,7 +304,8 @@ gs_buf_get(struct gs_buf *gb, char *buf, unsigned count)
  * usb_request or NULL if there is an error.
  */
 struct usb_request *
-gs_alloc_req(struct usb_ep *ep, unsigned len, gfp_t kmalloc_flags)
+gs_alloc_req(struct usb_ep *ep, unsigned int len, size_t extra_sz,
+		gfp_t kmalloc_flags)
 {
 	struct usb_request *req;
 
@@ -312,7 +313,7 @@ gs_alloc_req(struct usb_ep *ep, unsigned len, gfp_t kmalloc_flags)
 
 	if (req != NULL) {
 		req->length = len;
-		req->buf = kmalloc(len, kmalloc_flags);
+		req->buf = kmalloc(len + extra_sz, kmalloc_flags);
 		if (req->buf == NULL) {
 			usb_ep_free_request(ep, req);
 			return NULL;
@@ -510,6 +511,12 @@ static void gs_rx_push(unsigned long _port)
 
 	/* hand any queued data to the tty */
 	spin_lock_irq(&port->port_lock);
+#ifdef CONFIG_LGE_USB_GADGET
+	if (!port->port_usb) {
+		spin_unlock_irq(&port->port_lock);
+		return;
+	}
+#endif
 	tty = port->port.tty;
 	while (!list_empty(queue)) {
 		struct usb_request	*req;
@@ -654,6 +661,7 @@ static void gs_free_requests(struct usb_ep *ep, struct list_head *head,
 }
 
 static int gs_alloc_requests(struct usb_ep *ep, struct list_head *head,
+		size_t extra_sz,
 		void (*fn)(struct usb_ep *, struct usb_request *),
 		int *allocated)
 {
@@ -666,7 +674,7 @@ static int gs_alloc_requests(struct usb_ep *ep, struct list_head *head,
 	 * be as speedy as we might otherwise be.
 	 */
 	for (i = 0; i < n; i++) {
-		req = gs_alloc_req(ep, ep->maxpacket, GFP_ATOMIC);
+		req = gs_alloc_req(ep, ep->maxpacket, extra_sz, GFP_ATOMIC);
 		if (!req)
 			return list_empty(head) ? -ENOMEM : 0;
 		req->complete = fn;
@@ -688,6 +696,8 @@ static int gs_alloc_requests(struct usb_ep *ep, struct list_head *head,
  */
 static int gs_start_io(struct gs_port *port)
 {
+	struct usb_function	*f = &port->port_usb->func;
+	struct usb_composite_dev *cdev = f->config->cdev;
 	struct list_head	*head = &port->read_pool;
 	struct usb_ep		*ep = port->port_usb->out;
 	int			status;
@@ -699,12 +709,13 @@ static int gs_start_io(struct gs_port *port)
 	 * configurations may use different endpoints with a given port;
 	 * and high speed vs full speed changes packet sizes too.
 	 */
-	status = gs_alloc_requests(ep, head, gs_read_complete,
+	status = gs_alloc_requests(ep, head, 0, gs_read_complete,
 		&port->read_allocated);
 	if (status)
 		return status;
 
 	status = gs_alloc_requests(port->port_usb->in, &port->write_pool,
+			cdev->gadget->extra_buf_alloc,
 			gs_write_complete, &port->write_allocated);
 	if (status) {
 		gs_free_requests(ep, head, &port->read_allocated);
@@ -716,7 +727,11 @@ static int gs_start_io(struct gs_port *port)
 	started = gs_start_rx(port);
 
 	/* unblock any pending writes into our circular buffer */
+#ifndef CONFIG_LGE_USB_GADGET
 	if (started) {
+#else
+	if (started && port->port.tty) {
+#endif
 		tty_wakeup(port->port.tty);
 	} else {
 		gs_free_requests(ep, head, &port->read_allocated);
@@ -1025,6 +1040,85 @@ static int gs_break_ctl(struct tty_struct *tty, int duration)
 	return status;
 }
 
+#ifdef CONFIG_LGE_USB_GADGET
+static int gs_tiocmget(struct tty_struct *tty)
+{
+	struct gs_port  *port = tty->driver_data;
+	struct gserial  *gser;
+	unsigned int result = 0;
+
+	spin_lock_irq(&port->port_lock);
+	gser = port->port_usb;
+	if (!gser) {
+		result = -ENODEV;
+		goto fail;
+	}
+
+	if (gser->get_dtr)
+		result |= (gser->get_dtr(gser) ? TIOCM_DTR : 0);
+
+	if (gser->get_rts)
+		result |= (gser->get_rts(gser) ? TIOCM_RTS : 0);
+
+	if (gser->serial_state & TIOCM_CD)
+		result |= TIOCM_CD;
+
+	if (gser->serial_state & TIOCM_RI)
+		result |= TIOCM_RI;
+
+fail:
+	spin_unlock_irq(&port->port_lock);
+	return result;
+}
+
+static int gs_tiocmset(struct tty_struct *tty,
+		unsigned int set, unsigned int clear)
+{
+	struct gs_port  *port = tty->driver_data;
+	struct gserial *gser;
+	int status = 0;
+
+	spin_lock_irq(&port->port_lock);
+	gser = port->port_usb;
+
+	if (!gser) {
+		status = -ENODEV;
+		goto fail;
+	}
+
+	if (set & TIOCM_RI) {
+		if (gser->send_ring_indicator) {
+			gser->serial_state |= TIOCM_RI;
+			status = gser->send_ring_indicator(gser, 1);
+		}
+	}
+
+	if (clear & TIOCM_RI) {
+		if (gser->send_ring_indicator) {
+			gser->serial_state &= ~TIOCM_RI;
+			status = gser->send_ring_indicator(gser, 0);
+		}
+	}
+
+	if (set & TIOCM_CD) {
+		if (gser->send_carrier_detect) {
+			gser->serial_state |= TIOCM_CD;
+			status = gser->send_carrier_detect(gser, 1);
+		}
+	}
+
+	if (clear & TIOCM_CD) {
+		if (gser->send_carrier_detect) {
+			gser->serial_state &= ~TIOCM_CD;
+			status = gser->send_carrier_detect(gser, 0);
+		}
+	}
+fail:
+	spin_unlock_irq(&port->port_lock);
+	return status;
+}
+#endif
+
 static const struct tty_operations gs_tty_ops = {
 	.open =			gs_open,
 	.close =		gs_close,
@@ -1035,6 +1129,10 @@ static const struct tty_operations gs_tty_ops = {
 	.chars_in_buffer =	gs_chars_in_buffer,
 	.unthrottle =		gs_unthrottle,
 	.break_ctl =		gs_break_ctl,
+#ifdef CONFIG_LGE_USB_GADGET
+	.tiocmget =		gs_tiocmget,
+	.tiocmset =		gs_tiocmset,
+#endif
 };
 
 /*-------------------------------------------------------------------------*/
@@ -1300,9 +1398,13 @@ gs_port_alloc(unsigned port_num, struct usb_cdc_line_coding *coding)
 	}
 
 	tty_port_init(&port->port);
+	tty_buffer_set_limit(&port->port, 8388608);
 	spin_lock_init(&port->port_lock);
 	init_waitqueue_head(&port->drain_wait);
 	init_waitqueue_head(&port->close_wait);
+
+	pr_debug("%s open:ttyGS%d and set 8388608, avail:%d\n", __func__,
+		port_num, tty_buffer_space_avail(&port->port));
 
 	tasklet_init(&port->push, gs_rx_push, (unsigned long) port);
 

@@ -34,6 +34,7 @@
 #include <linux/mutex.h>
 #include <linux/anon_inodes.h>
 #include <linux/device.h>
+#include <linux/freezer.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/mman.h>
@@ -1264,13 +1265,27 @@ static int ep_create_wakeup_source(struct epitem *epi)
 {
 	const char *name;
 	struct wakeup_source *ws;
+#ifdef CONFIG_LGE_PM
+	char buf[40] = {0,};
 
+	name = epi->ffd.file->f_path.dentry->d_name.name;
+	if (!name)
+		sprintf(buf, "eventpoll");
+	else
+		sprintf(buf, "eventpoll-%s", name);
+
+	if (!epi->ep->ws) {
+		epi->ep->ws = wakeup_source_register(buf);
+		if (!epi->ep->ws)
+			return -ENOMEM;
+	}
+#else
 	if (!epi->ep->ws) {
 		epi->ep->ws = wakeup_source_register("eventpoll");
 		if (!epi->ep->ws)
 			return -ENOMEM;
 	}
-
+#endif
 	name = epi->ffd.file->f_path.dentry->d_name.name;
 	ws = wakeup_source_register(name);
 
@@ -1673,7 +1688,8 @@ fetch_events:
 			}
 
 			spin_unlock_irqrestore(&ep->lock, flags);
-			if (!schedule_hrtimeout_range(to, slack, HRTIMER_MODE_ABS))
+			if (!freezable_schedule_hrtimeout_range(to, slack,
+								HRTIMER_MODE_ABS))
 				timed_out = 1;
 
 			spin_lock_irqsave(&ep->lock, flags);
