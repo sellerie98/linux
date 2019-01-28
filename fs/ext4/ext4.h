@@ -2352,6 +2352,7 @@ static inline void ext4_fname_free_filename(struct ext4_filename *fname) { }
 #define fscrypt_fname_free_buffer	fscrypt_notsupp_fname_free_buffer
 #define fscrypt_fname_disk_to_usr	fscrypt_notsupp_fname_disk_to_usr
 #define fscrypt_fname_usr_to_disk	fscrypt_notsupp_fname_usr_to_disk
+#define fs_using_hardware_encryption fs_notsupp_using_hardware_encryption
 #endif
 
 /* dir.c */
@@ -2450,7 +2451,8 @@ extern int ext4_mb_add_groupinfo(struct super_block *sb,
 		ext4_group_t i, struct ext4_group_desc *desc);
 extern int ext4_group_add_blocks(handle_t *handle, struct super_block *sb,
 				ext4_fsblk_t block, unsigned long count);
-extern int ext4_trim_fs(struct super_block *, struct fstrim_range *);
+extern int ext4_trim_fs(struct super_block *, struct fstrim_range *,
+				unsigned long blkdev_flags);
 
 /* inode.c */
 int ext4_inode_is_fast_symlink(struct inode *inode);

@@ -273,6 +273,10 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/random.h>
 
+#ifdef CONFIG_CRYPTO_CCMODE
+#include <linux/cc_mode.h>
+#define RETRY_CNT_SIZE 300
+#endif //CONFIG_CRYPTO_CCMODE
 /* #define ADD_INTERRUPT_BENCH */
 
 /*
@@ -1730,6 +1734,49 @@ _random_read(int nonblock, char __user *buf, size_t nbytes)
 }
 
 static ssize_t
+_random_read_cc(int nonblock, char __user *buf, size_t nbytes)
+{
+	ssize_t n = 0;
+	size_t tot_len = 0, ent_len = 0;
+	int retry_cnt = RETRY_CNT_SIZE;
+
+	if (nbytes == 0)
+		return 0;
+
+	nbytes = min_t(size_t, nbytes, SEC_XFER_SIZE);
+	ent_len = nbytes;
+	while (1) {
+		n = extract_entropy_user(&blocking_pool, buf+tot_len, ent_len);
+		if (n < 0)
+			return n;
+		trace_random_read(n*8, (ent_len-n)*8,
+				  ENTROPY_BITS(&blocking_pool),
+				  ENTROPY_BITS(&input_pool));
+
+		tot_len += n;
+		ent_len -= n;
+
+		if(tot_len > nbytes)
+			tot_len = nbytes;
+		else if(ent_len < 0)
+			ent_len = 0;
+
+		if (tot_len == nbytes)
+			return tot_len;
+
+		if(retry_cnt-- < 0)
+			return -EAGAIN;
+
+		wait_event_interruptible(random_read_wait,
+			ENTROPY_BITS(&input_pool) >=
+			random_read_wakeup_bits);
+		if (signal_pending(current))
+			return -ERESTARTSYS;
+	}
+}
+
+
+static ssize_t
 random_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
 {
 	return _random_read(file->f_flags & O_NONBLOCK, buf, nbytes);
@@ -1740,7 +1787,10 @@ urandom_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
 {
 	unsigned long flags;
 	static int maxwarn = 10;
-	int ret;
+	ssize_t ret = 0;
+#ifdef CONFIG_CRYPTO_CCMODE
+	int cc_flag = 0;
+#endif //CONFIG_CRYPTO_CCMODE
 
 	if (!crng_ready() && maxwarn > 0) {
 		maxwarn--;
@@ -1752,8 +1802,24 @@ urandom_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
 		spin_unlock_irqrestore(&primary_crng.lock, flags);
 	}
 	nbytes = min_t(size_t, nbytes, INT_MAX >> (ENTROPY_SHIFT + 3));
+#ifdef CONFIG_CRYPTO_CCMODE
+	cc_flag = get_cc_mode_state();
+	if ((cc_flag & FLAG_FORCE_USE_RANDOM_DEV) == FLAG_FORCE_USE_RANDOM_DEV) {
+        /* When SYSCALL(getrandom) is called,
+           If file or ppos pointer is NULL, set nonblock 0 */
+        if (file == NULL || ppos == NULL)
+			ret = _random_read_cc(0, buf, nbytes);
+        else
+			ret = _random_read_cc(file->f_flags & O_NONBLOCK, buf, nbytes);
+	}
+	else {
+#endif
 	ret = extract_crng_user(buf, nbytes);
 	trace_urandom_read(8 * nbytes, 0, ENTROPY_BITS(&input_pool));
+#ifdef CONFIG_CRYPTO_CCMODE
+    }
+#endif
+
 	return ret;
 }
 
@@ -2044,8 +2110,8 @@ struct ctl_table random_table[] = {
 
 struct batched_entropy {
 	union {
-		unsigned long entropy_long[CHACHA20_BLOCK_SIZE / sizeof(unsigned long)];
-		unsigned int entropy_int[CHACHA20_BLOCK_SIZE / sizeof(unsigned int)];
+		u64 entropy_u64[CHACHA20_BLOCK_SIZE / sizeof(u64)];
+		u32 entropy_u32[CHACHA20_BLOCK_SIZE / sizeof(u32)];
 	};
 	unsigned int position;
 };
@@ -2055,52 +2121,51 @@ struct batched_entropy {
  * number is either as good as RDRAND or as good as /dev/urandom, with the
  * goal of being quite fast and not depleting entropy.
  */
-static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_long);
-unsigned long get_random_long(void)
+static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_u64);
+u64 get_random_u64(void)
 {
-	unsigned long ret;
+	u64 ret;
 	struct batched_entropy *batch;
 
-	if (arch_get_random_long(&ret))
+#if BITS_PER_LONG == 64
+	if (arch_get_random_long((unsigned long *)&ret))
 		return ret;
+#else
+	if (arch_get_random_long((unsigned long *)&ret) &&
+	    arch_get_random_long((unsigned long *)&ret + 1))
+	    return ret;
+#endif
 
-	batch = &get_cpu_var(batched_entropy_long);
-	if (batch->position % ARRAY_SIZE(batch->entropy_long) == 0) {
-		extract_crng((u8 *)batch->entropy_long);
+	batch = &get_cpu_var(batched_entropy_u64);
+	if (batch->position % ARRAY_SIZE(batch->entropy_u64) == 0) {
+		extract_crng((u8 *)batch->entropy_u64);
 		batch->position = 0;
 	}
-	ret = batch->entropy_long[batch->position++];
-	put_cpu_var(batched_entropy_long);
+	ret = batch->entropy_u64[batch->position++];
+	put_cpu_var(batched_entropy_u64);
 	return ret;
 }
-EXPORT_SYMBOL(get_random_long);
+EXPORT_SYMBOL(get_random_u64);
 
-#if BITS_PER_LONG == 32
-unsigned int get_random_int(void)
+static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_u32);
+u32 get_random_u32(void)
 {
-	return get_random_long();
-}
-#else
-static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_int);
-unsigned int get_random_int(void)
-{
-	unsigned int ret;
+	u32 ret;
 	struct batched_entropy *batch;
 
 	if (arch_get_random_int(&ret))
 		return ret;
 
-	batch = &get_cpu_var(batched_entropy_int);
-	if (batch->position % ARRAY_SIZE(batch->entropy_int) == 0) {
-		extract_crng((u8 *)batch->entropy_int);
+	batch = &get_cpu_var(batched_entropy_u32);
+	if (batch->position % ARRAY_SIZE(batch->entropy_u32) == 0) {
+		extract_crng((u8 *)batch->entropy_u32);
 		batch->position = 0;
 	}
-	ret = batch->entropy_int[batch->position++];
-	put_cpu_var(batched_entropy_int);
+	ret = batch->entropy_u32[batch->position++];
+	put_cpu_var(batched_entropy_u32);
 	return ret;
 }
-#endif
-EXPORT_SYMBOL(get_random_int);
+EXPORT_SYMBOL(get_random_u32);
 
 /**
  * randomize_page - Generate a random, page aligned address

@@ -508,6 +508,7 @@ int security_path_chown(const struct path *path, kuid_t uid, kgid_t gid)
 		return 0;
 	return call_int_hook(path_chown, 0, path, uid, gid);
 }
+EXPORT_SYMBOL(security_path_chown);
 
 int security_path_chroot(const struct path *path)
 {
@@ -522,6 +523,14 @@ int security_inode_create(struct inode *dir, struct dentry *dentry, umode_t mode
 	return call_int_hook(inode_create, 0, dir, dentry, mode);
 }
 EXPORT_SYMBOL_GPL(security_inode_create);
+
+int security_inode_post_create(struct inode *dir, struct dentry *dentry,
+			       umode_t mode)
+{
+	if (unlikely(IS_PRIVATE(dir)))
+		return 0;
+	return call_int_hook(inode_post_create, 0, dir, dentry, mode);
+}
 
 int security_inode_link(struct dentry *old_dentry, struct inode *dir,
 			 struct dentry *new_dentry)
@@ -1589,7 +1598,7 @@ int security_audit_rule_match(u32 secid, u32 field, u32 op, void *lsmrule,
 }
 #endif /* CONFIG_AUDIT */
 
-struct security_hook_heads security_hook_heads = {
+struct security_hook_heads security_hook_heads __lsm_ro_after_init = {
 	.binder_set_context_mgr =
 		LIST_HEAD_INIT(security_hook_heads.binder_set_context_mgr),
 	.binder_transaction =
@@ -1667,6 +1676,8 @@ struct security_hook_heads security_hook_heads = {
 	.inode_init_security =
 		LIST_HEAD_INIT(security_hook_heads.inode_init_security),
 	.inode_create =	LIST_HEAD_INIT(security_hook_heads.inode_create),
+	.inode_post_create =
+		LIST_HEAD_INIT(security_hook_heads.inode_post_create),
 	.inode_link =	LIST_HEAD_INIT(security_hook_heads.inode_link),
 	.inode_unlink =	LIST_HEAD_INIT(security_hook_heads.inode_unlink),
 	.inode_symlink =

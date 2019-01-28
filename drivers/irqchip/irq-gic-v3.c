@@ -28,6 +28,7 @@
 #include <linux/of_irq.h>
 #include <linux/percpu.h>
 #include <linux/slab.h>
+#include <linux/msm_rtb.h>
 
 #include <linux/irqchip.h>
 #include <linux/irqchip/arm-gic-common.h>
@@ -40,6 +41,18 @@
 #include <asm/virt.h>
 
 #include "irq-gic-common.h"
+
+#define MAX_IRQ			1020	/* Max number of SGI+PPI+SPI */
+#define SPI_START_IRQ		32	/* SPI start irq number */
+#define GICD_ICFGR_BITS		2	/* 2 bits per irq in GICD_ICFGR */
+#define GICD_ISENABLER_BITS	1	/* 1 bit per irq in GICD_ISENABLER */
+#define GICD_IPRIORITYR_BITS	8	/* 8 bits per irq in GICD_IPRIORITYR */
+
+/* 32 bit mask with lower n bits set */
+#define UMASK_LOW(n)		(~0U >> (32 - (n)))
+
+/* Irq bit position within a word for GICD_ISENABLER_BITS */
+#define IRQ_BIT(n)	(1 << ((n) % 32))
 
 struct redist_region {
 	void __iomem		*redist_base;
@@ -57,6 +70,17 @@ struct gic_chip_data {
 	u32			nr_redist_regions;
 	unsigned int		irq_nr;
 	struct partition_desc	*ppi_descs[16];
+	u64 saved_spi_router[MAX_IRQ];
+	u32 saved_spi_enable[DIV_ROUND_UP(MAX_IRQ, 32 / GICD_ISENABLER_BITS)];
+	u32 saved_spi_cfg[DIV_ROUND_UP(MAX_IRQ, 32 / GICD_ICFGR_BITS)];
+	u32 saved_spi_priority[DIV_ROUND_UP(MAX_IRQ,
+				32 / GICD_IPRIORITYR_BITS)];
+
+	u64 changed_spi_router[MAX_IRQ];
+	u32 changed_spi_enable[DIV_ROUND_UP(MAX_IRQ, 32 / GICD_ISENABLER_BITS)];
+	u32 changed_spi_cfg[DIV_ROUND_UP(MAX_IRQ, 32 / GICD_ICFGR_BITS)];
+	u32 changed_spi_priority[DIV_ROUND_UP(MAX_IRQ,
+				32 / GICD_IPRIORITYR_BITS)];
 };
 
 static struct gic_chip_data gic_data __read_mostly;
@@ -96,11 +120,13 @@ static void gic_do_wait_for_rwp(void __iomem *base)
 {
 	u32 count = 1000000;	/* 1s! */
 
-	while (readl_relaxed(base + GICD_CTLR) & GICD_CTLR_RWP) {
+	while (readl_relaxed_no_log(base + GICD_CTLR) & GICD_CTLR_RWP) {
 		count--;
 		if (!count) {
 			pr_err_ratelimited("RWP timeout, gone fishing\n");
-			return;
+			/* DEBUG: Crash here to get the context info. */
+			BUG();
+			//return;
 		}
 		cpu_relax();
 		udelay(1);
@@ -130,6 +156,369 @@ static u64 __maybe_unused gic_read_iar(void)
 		return gic_read_iar_common();
 }
 #endif
+
+void gic_v3_dist_save(void)
+{
+	void __iomem *base = gic_data.dist_base;
+	int i;
+	int irq_nr = gic_data.irq_nr - SPI_START_IRQ;
+
+	for (i = 0; i < DIV_ROUND_UP(irq_nr, 32 / GICD_ICFGR_BITS); i++)
+		gic_data.saved_spi_cfg[i] = readl_relaxed_no_log(
+		    base + GICD_ICFGR + i * 4 +
+		    SPI_START_IRQ * GICD_ICFGR_BITS / 8); /* SPI byte offset */
+
+	for (i = 0; i < DIV_ROUND_UP(irq_nr, 32 / GICD_IPRIORITYR_BITS); i++)
+		gic_data.saved_spi_priority[i] = readl_relaxed_no_log(
+		    base + GICD_IPRIORITYR + i * 4 +
+		    SPI_START_IRQ * GICD_IPRIORITYR_BITS / 8); /* SPI offset */
+
+	for (i = 0; i < DIV_ROUND_UP(irq_nr, 32 / GICD_ISENABLER_BITS); i++)
+		gic_data.saved_spi_enable[i] = readl_relaxed_no_log(
+		    base + GICD_ISENABLER + i * 4 +
+		    SPI_START_IRQ * GICD_ISENABLER_BITS / 8); /* SPI offset */
+
+	for (i = 32; i < gic_data.irq_nr; i++)
+		gic_data.saved_spi_router[i] =
+			gic_read_irouter(base + GICD_IROUTER + i * 8);
+}
+
+static void _gic_v3_dist_check_icfgr(bool *pending)
+{
+	u32 current_cfg = 0;
+	int i, j = SPI_START_IRQ, l;
+	u32 k;
+	int irq_nr = gic_data.irq_nr - SPI_START_IRQ;
+	void __iomem *base = gic_data.dist_base;
+
+	for (i = 0; i < DIV_ROUND_UP(irq_nr, 32 / GICD_ICFGR_BITS); i++) {
+		current_cfg = readl_relaxed_no_log(
+					base + GICD_ICFGR + i * 4 +
+					SPI_START_IRQ * GICD_ICFGR_BITS / 8);
+
+		if (current_cfg != gic_data.saved_spi_cfg[i]) {
+			for (k = current_cfg ^ gic_data.saved_spi_cfg[i],
+			     l = 0; k ; k >>= GICD_ICFGR_BITS, l++) {
+				if (k & UMASK_LOW(GICD_ICFGR_BITS)) {
+					trace_printk("GIC Restore ICFG for : %u\n", (j+l));
+					pending[j+l] = 1;
+				}
+			}
+			gic_data.changed_spi_cfg[i] =
+					current_cfg ^ gic_data.saved_spi_cfg[i];
+		}
+		j += 32 / GICD_ICFGR_BITS; /* SPIs per word in GICD_ICFGR */
+	}
+}
+
+static void _gic_v3_dist_restore_icfgr(void)
+{
+	int i;
+	int irq_nr = gic_data.irq_nr - SPI_START_IRQ;
+	void __iomem *base = gic_data.dist_base;
+
+	for (i = 0; i < DIV_ROUND_UP(irq_nr, 32 / GICD_ICFGR_BITS); i++) {
+		if (gic_data.changed_spi_cfg[i]) {
+			writel_relaxed_no_log(
+				gic_data.saved_spi_cfg[i],
+				base + GICD_ICFGR + i * 4 +
+					SPI_START_IRQ * GICD_ICFGR_BITS / 8);
+		}
+	}
+
+	/* Commit GICD_ICFGR writes before subsequent writes */
+	wmb();
+}
+
+static void _gic_v3_dist_check_ipriorityr(bool *pending)
+{
+	u32 current_cfg = 0;
+	int i, j = SPI_START_IRQ, l;
+	u32 k;
+	int irq_nr = gic_data.irq_nr - SPI_START_IRQ;
+	void __iomem *base = gic_data.dist_base;
+
+	for (i = 0; i < DIV_ROUND_UP(irq_nr, 32 / GICD_IPRIORITYR_BITS); i++) {
+		current_cfg = readl_relaxed_no_log(
+				base + GICD_IPRIORITYR + i * 4 +
+				SPI_START_IRQ * GICD_IPRIORITYR_BITS / 8);
+
+		if (current_cfg != gic_data.saved_spi_priority[i]) {
+			for (k = current_cfg ^ gic_data.saved_spi_priority[i],
+			   l = 0; k ; k >>= GICD_IPRIORITYR_BITS, l++) {
+				if (k & UMASK_LOW(GICD_IPRIORITYR_BITS)) {
+					trace_printk("GIC Restore IPRIORITYR : %u\n", (j+l));
+					pending[j+l] = 1;
+				}
+			}
+			gic_data.changed_spi_priority[i] =
+					current_cfg ^ gic_data.saved_spi_priority[i];
+		}
+		j += 32 / GICD_IPRIORITYR_BITS;
+	}
+}
+
+static void _gic_v3_dist_restore_ipriorityr(void)
+{
+	void __iomem *base = gic_data.dist_base;
+	int i;
+	int irq_nr = gic_data.irq_nr - SPI_START_IRQ;
+
+	for (i = 0; i < DIV_ROUND_UP(irq_nr, 32 / GICD_IPRIORITYR_BITS); i++) {
+		if (gic_data.changed_spi_priority[i]) {
+			writel_relaxed_no_log(
+				gic_data.saved_spi_priority[i],
+				base + GICD_IPRIORITYR + i * 4 +
+					SPI_START_IRQ * GICD_IPRIORITYR_BITS / 8);
+		}
+	}
+
+	/* Commit GICD_IPRIORITYR writes before subsequent writes */
+	wmb();
+}
+
+static void _gic_v3_dist_check_isenabler(bool *pending)
+{
+	u32 current_cfg = 0;
+	int i, j = SPI_START_IRQ, l;
+	u32 k;
+	int irq_nr = gic_data.irq_nr - SPI_START_IRQ;
+	void __iomem *base = gic_data.dist_base;
+
+	for (i = 0; i < DIV_ROUND_UP(irq_nr, 32 / GICD_ISENABLER_BITS); i++) {
+		current_cfg = readl_relaxed_no_log(
+				base + GICD_ISENABLER + i * 4 +
+				SPI_START_IRQ * GICD_ISENABLER_BITS / 8);
+		if (current_cfg != gic_data.saved_spi_enable[i]) {
+			for (k = current_cfg ^ gic_data.saved_spi_enable[i],
+			    l = 0; k ; k >>= GICD_ISENABLER_BITS, l++) {
+				if (k & UMASK_LOW(GICD_ISENABLER_BITS)) {
+					trace_printk("GIC Restore ISENABLER : %u\n", (j+l));
+					pending[j+l] = 1;
+				}
+			}
+			gic_data.changed_spi_enable[i] =
+				current_cfg ^ gic_data.saved_spi_enable[i];
+		}
+
+		j += 32 / GICD_ISENABLER_BITS;
+	}
+}
+
+static void _gic_v3_dist_restore_isenabler(bool *pending)
+{
+	void __iomem *base = gic_data.dist_base;
+	int i, j = SPI_START_IRQ, l;
+	int irq_nr = gic_data.irq_nr - SPI_START_IRQ;
+
+	for (i = 0; i < DIV_ROUND_UP(irq_nr, 32); i++, j += 32) {
+		/*
+		 * 32 irqs per word in GICD_ISENABLER.
+		 * SPIs offset is byte 4.
+		 */
+		u32 isenabler = readl_relaxed_no_log(
+				base + GICD_ISENABLER + i * 4 + 4);
+		bool pending_updated = 0;
+
+		for (l = 0; l < 32; l++) {
+			if (pending[j+l]) {
+				isenabler |= BIT(l);
+				pending_updated = 1;
+			}
+		}
+
+		if (pending_updated) {
+			trace_printk("GIC Restore GICD_ISENABLER for : %u val : %x \n",
+							((i * 4) + 4), isenabler);
+			writel_relaxed_no_log(
+				isenabler, base + GICD_ISENABLER + i * 4 + 4);
+		}
+	}
+
+	/* Commit GICD_ISENABLER writes before proceeding */
+	wmb();
+}
+
+static void _gic_v3_dist_check_irouter(bool *pending)
+{
+	void __iomem *base = gic_data.dist_base;
+	u64 current_irouter_cfg = 0;
+	int i, j = SPI_START_IRQ;
+
+	for (i = 32; i < gic_data.irq_nr; i++, j++) {
+		if (i == 38)
+			continue;
+		current_irouter_cfg = gic_read_irouter(
+					base + GICD_IROUTER + i * 8);
+		if (current_irouter_cfg != gic_data.saved_spi_router[i]) {
+			pending[j] = 1;
+			gic_data.changed_spi_router[i] =
+			    current_irouter_cfg ^ gic_data.saved_spi_router[i];
+			trace_printk("GIC Restore IROUTER for : %u\n", (i *8));
+		}
+	}
+}
+
+static void _gic_v3_dist_restore_irouter(void)
+{
+	void __iomem *base = gic_data.dist_base;
+	int i;
+
+	for (i = 32; i < gic_data.irq_nr; i++) {
+		if (i == 38)
+			continue;
+		if (gic_data.changed_spi_router[i]) {
+			gic_write_irouter(gic_data.saved_spi_router[i],
+						base + GICD_IROUTER + i * 8);
+		}
+	}
+
+	/* Commit GICD_IPRIORITYR writes before subsequent writes */
+	wmb();
+}
+
+static void _gic_v3_dist_set_icenabler(bool *pending)
+{
+	void __iomem *base = gic_data.dist_base;
+	int i;
+
+	for (i = 32; i < gic_data.irq_nr; i++) {
+		if (pending[i]) {
+			trace_printk("GIC Restore _gic_v3_dist_set_icenabler : %u\n", i);
+			writel_relaxed_no_log(IRQ_BIT(i),
+				base + GICD_ICENABLER + (i / 32) * 4);
+		}
+	}
+
+	/* Commit GICD_ICENABLER writes before subsequent writes */
+	wmb();
+}
+
+static void _gic_v3_dist_restore_ispending(bool *pending)
+{
+	void __iomem *base = gic_data.dist_base;
+	int i, j = SPI_START_IRQ, l;
+	int irq_nr = gic_data.irq_nr - SPI_START_IRQ;
+
+	for (i = 0; i < DIV_ROUND_UP(irq_nr, 32); i++, j += 32) {
+		/*
+		 * 32 irqs per word in GICD_ISPENDR.
+		 * SPIs offset is byte 4.
+		 */
+		u32 ispending = readl_relaxed_no_log(
+				base + GICD_ISPENDR + i * 4 + 4);
+		u32 ic_pending = 0;
+		bool pending_updated = 0;
+
+		for (l = 0; l < 32; l++) {
+			if (pending[j+l]) {
+				ispending |= BIT(l);
+				ic_pending |= BIT(l);
+				pending_updated = 1;
+			}
+		}
+
+		if (pending_updated) {
+			trace_printk("GIC Restore GICD_ISPENDR for : %u val : %x \n",
+							((i * 4) + 4), ispending);
+			writel_relaxed_no_log(ic_pending, base + GICD_ICPENDR + i * 4 + 4);
+			/* Commit GICD_ICPENDR before GICD_ISPENDR write */
+			wmb();
+			writel_relaxed_no_log(
+				ispending, base + GICD_ISPENDR + i * 4 + 4);
+		}
+	}
+
+	/* Commit GICD_ICPENDR writes before proceeding */
+	wmb();
+}
+
+static void _gic_v3_dist_set_icactive(bool *pending)
+{
+	void __iomem *base = gic_data.dist_base;
+	int i;
+
+	for (i = 32; i < gic_data.irq_nr; i++) {
+		if (pending[i]) {
+			trace_printk("GIC Restore _gic_v3_dist_set_icactive : %u\n", i);
+			writel_relaxed_no_log(IRQ_BIT(i),
+				base + GICD_ICACTIVER + (i / 32) * 4);
+		}
+	}
+
+	/* Commit GICD_ICACTIVER writes before subsequent writes */
+	wmb();
+}
+
+void gic_v3_dist_restore(void)
+{
+	bool pending[MAX_IRQ] = {0};
+
+	_gic_v3_dist_check_icfgr(pending);
+
+	_gic_v3_dist_check_ipriorityr(pending);
+
+	_gic_v3_dist_check_isenabler(pending);
+
+	_gic_v3_dist_check_irouter(pending);
+
+	_gic_v3_dist_set_icenabler(pending);
+
+	gic_dist_wait_for_rwp();
+
+	_gic_v3_dist_restore_icfgr();
+
+	_gic_v3_dist_restore_ipriorityr();
+
+	_gic_v3_dist_restore_irouter();
+
+	_gic_v3_dist_set_icactive(pending);
+
+	_gic_v3_dist_restore_ispending(pending);
+
+	_gic_v3_dist_restore_isenabler(pending);
+
+	gic_dist_wait_for_rwp();
+}
+
+/*
+ * gic_show_pending_irq - Shows the pending interrupts
+ * Note: Interrupts should be disabled on the cpu from which
+ * this is called to get accurate list of pending interrupts.
+ */
+void gic_show_pending_irqs(void)
+{
+	void __iomem *base;
+	u32 pending[32], enabled;
+	unsigned int j;
+
+	base = gic_data.dist_base;
+	for (j = 0; j * 32 < gic_data.irq_nr; j++) {
+		enabled = readl_relaxed(base +
+					GICD_ISENABLER + j * 4);
+		pending[j] = readl_relaxed(base +
+					GICD_ISPENDR + j * 4);
+		pending[j] &= enabled;
+		pr_err("Pending irqs[%d] %x\n", j, pending[j]);
+	}
+}
+
+/*
+ * get_gic_highpri_irq - Returns next high priority interrupt on current CPU
+ */
+unsigned int get_gic_highpri_irq(void)
+{
+	unsigned long flags;
+	unsigned int val = 0;
+
+	local_irq_save(flags);
+	val = read_gicreg(ICC_HPPIR1_EL1);
+	local_irq_restore(flags);
+
+	if (val >= 1020)
+		return 0;
+	return val;
+}
 
 static void gic_enable_redist(bool enable)
 {
@@ -178,7 +567,7 @@ static int gic_peek_irq(struct irq_data *d, u32 offset)
 	else
 		base = gic_data.dist_base;
 
-	return !!(readl_relaxed(base + offset + (gic_irq(d) / 32) * 4) & mask);
+	return !!(readl_relaxed_no_log(base + offset + (gic_irq(d) / 32) * 4) & mask);
 }
 
 static void gic_poke_irq(struct irq_data *d, u32 offset)
@@ -352,6 +741,7 @@ static asmlinkage void __exception_irq_entry gic_handle_irq(struct pt_regs *regs
 		if (likely(irqnr > 15 && irqnr < 1020) || irqnr >= 8192) {
 			int err;
 
+			uncached_logk(LOGK_IRQ, (void *)(uintptr_t)irqnr);
 			if (static_key_true(&supports_deactivate))
 				gic_write_eoir(irqnr);
 
@@ -368,6 +758,7 @@ static asmlinkage void __exception_irq_entry gic_handle_irq(struct pt_regs *regs
 			continue;
 		}
 		if (irqnr < 16) {
+			uncached_logk(LOGK_IRQ, (void *)(uintptr_t)irqnr);
 			gic_write_eoir(irqnr);
 			if (static_key_true(&supports_deactivate))
 				gic_write_dir(irqnr);
@@ -455,9 +846,6 @@ static int gic_populate_rdist(void)
 				u64 offset = ptr - gic_data.redist_regions[i].redist_base;
 				gic_data_rdist_rd_base() = ptr;
 				gic_data_rdist()->phys_base = gic_data.redist_regions[i].phys_base + offset;
-				pr_info("CPU%d: found redistributor %lx region %d:%pa\n",
-					smp_processor_id(), mpidr, i,
-					&gic_data_rdist()->phys_base);
 				return 0;
 			}
 
@@ -538,7 +926,8 @@ static void gic_cpu_init(void)
 	gic_cpu_config(rbase, gic_redist_wait_for_rwp);
 
 	/* Give LPIs a spin */
-	if (IS_ENABLED(CONFIG_ARM_GIC_V3_ITS) && gic_dist_supports_lpis())
+	if (IS_ENABLED(CONFIG_ARM_GIC_V3_ITS) && gic_dist_supports_lpis() &&
+					!IS_ENABLED(CONFIG_ARM_GIC_V3_ACL))
 		its_cpu_init();
 
 	/* initialise system registers */
@@ -688,6 +1077,9 @@ static bool gic_dist_security_disabled(void)
 static int gic_cpu_pm_notifier(struct notifier_block *self,
 			       unsigned long cmd, void *v)
 {
+	if (from_suspend)
+		return NOTIFY_OK;
+
 	if (cmd == CPU_PM_EXIT) {
 		if (gic_dist_security_disabled())
 			gic_enable_redist(true);
@@ -962,7 +1354,8 @@ static int __init gic_init_bases(void __iomem *dist_base,
 
 	set_handle_irq(gic_handle_irq);
 
-	if (IS_ENABLED(CONFIG_ARM_GIC_V3_ITS) && gic_dist_supports_lpis())
+	if (IS_ENABLED(CONFIG_ARM_GIC_V3_ITS) && gic_dist_supports_lpis() &&
+	    !IS_ENABLED(CONFIG_ARM_GIC_V3_ACL))
 		its_init(handle, &gic_data.rdists, gic_data.domain);
 
 	gic_smp_init();

@@ -84,7 +84,14 @@ struct regmap;
 #define REGULATOR_MODE_NORMAL			0x2
 #define REGULATOR_MODE_IDLE			0x4
 #define REGULATOR_MODE_STANDBY			0x8
-
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+#define REGULATOR_MODE_SHUTDOWN			0x10
+#define REGULATOR_MODE_SPARE_ON			0x20
+#define REGULATOR_MODE_TTW_ON			0x40
+#define REGULATOR_MODE_TTW_OFF			0x80
+#define REGULATOR_MODE_ENABLE_PULLDOWN		0xA0
+#define REGULATOR_MODE_DISABLE_PULLDOWN		0xB0
+#endif
 /*
  * Regulator notifier events.
  *
@@ -103,6 +110,7 @@ struct regmap;
  *                      Data passed is old voltage cast to (void *).
  * PRE_DISABLE    Regulator is about to be disabled
  * ABORT_DISABLE  Regulator disable failed for some reason
+ * ENABLE         Regulator was enabled.
  *
  * NOTE: These events can be OR'ed together when passed into handler.
  */
@@ -119,6 +127,7 @@ struct regmap;
 #define REGULATOR_EVENT_ABORT_VOLTAGE_CHANGE	0x200
 #define REGULATOR_EVENT_PRE_DISABLE		0x400
 #define REGULATOR_EVENT_ABORT_DISABLE		0x800
+#define REGULATOR_EVENT_ENABLE			0x1000
 
 /**
  * struct pre_voltage_change_data - Data sent with PRE_VOLTAGE_CHANGE event
@@ -223,6 +232,7 @@ void regulator_bulk_free(int num_consumers,
 
 int regulator_count_voltages(struct regulator *regulator);
 int regulator_list_voltage(struct regulator *regulator, unsigned selector);
+int regulator_list_corner_voltage(struct regulator *regulator, int corner);
 int regulator_is_supported_voltage(struct regulator *regulator,
 				   int min_uV, int max_uV);
 unsigned int regulator_get_linear_step(struct regulator *regulator);
@@ -550,6 +560,11 @@ static inline int regulator_list_voltage(struct regulator *regulator, unsigned s
 	return -EINVAL;
 }
 
+static inline int regulator_list_corner_voltage(struct regulator *regulator,
+	int corner)
+{
+	return -EINVAL;
+}
 #endif
 
 static inline int regulator_set_voltage_triplet(struct regulator *regulator,
